@@ -1,16 +1,19 @@
+#include <WiFi.h>
 #include "esp_camera.h"
-#include "WiFi.h"
+
+// Select the AI-Thinker pin definition for the ESP32-CAM module.
 #define CAMERA_MODEL_AI_THINKER
 #include "camera_pins.h"
 
-const int INPUT_PIN  = 13; 
-const int OUTPUT_PIN = 12; 
-const char* ssid = "YOUR_WIFI";
-const char* password = "YOUR_PASSWORD";
+// Update these with your Wi-Fi credentials.
+constexpr const char* WIFI_SSID = "REPLACE_WITH_YOUR_SSID";
+constexpr const char* WIFI_PASSWORD = "REPLACE_WITH_YOUR_PASSWORD";
 
+// HTTP server that will serve the MJPEG stream.
 WiFiServer server(80);
 
-void startCamera() {
+// Configure and initialize the camera hardware.
+bool initCamera() {
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -33,7 +36,7 @@ void startCamera() {
     config.xclk_freq_hz = 20000000;
     config.pixel_format = PIXFORMAT_JPEG;
 
-    if(psramFound()) {
+    if (psramFound()) {
         config.frame_size = FRAMESIZE_VGA;
         config.jpeg_quality = 10;
         config.fb_count = 2;
@@ -43,72 +46,96 @@ void startCamera() {
         config.fb_count = 1;
     }
 
-    if (esp_camera_init(&config) != ESP_OK) {
-        Serial.println("Camera init failed");
-        return;
+    esp_err_t err = esp_camera_init(&config);
+    if (err != ESP_OK) {
+        Serial.printf("Camera init failed with error 0x%x\n", err);
+        return false;
     }
+
+    sensor_t* sensor = esp_camera_sensor_get();
+    sensor->set_brightness(sensor, 0);
+    sensor->set_contrast(sensor, 0);
+    sensor->set_saturation(sensor, 0);
+
     Serial.println("Camera initialized.");
+    return true;
+}
+
+// Wait for an HTTP request header terminator (a blank line).
+void readClientRequest(WiFiClient& client) {
+    while (client.connected()) {
+        if (!client.available()) {
+            delay(1);
+            continue;
+        }
+
+        String line = client.readStringUntil('\n');
+        if (line.length() <= 1) {
+            break;  // Empty line marks end of header.
+        }
+    }
+}
+
+// Stream MJPEG data to the connected client until they disconnect.
+void streamCamera(WiFiClient& client) {
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+    client.println("Cache-Control: no-cache");
+    client.println();
+
+    while (client.connected()) {
+        camera_fb_t* fb = esp_camera_fb_get();
+        if (!fb) {
+            Serial.println("Failed to grab frame");
+            break;
+        }
+
+        client.printf("--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", fb->len);
+        client.write(fb->buf, fb->len);
+        client.print("\r\n");
+
+        esp_camera_fb_return(fb);
+        delay(30);
+    }
 }
 
 void setup() {
     Serial.begin(115200);
+    Serial.setDebugOutput(true);
+    Serial.println();
 
-    pinMode(INPUT_PIN, INPUT_PULLUP);
-    pinMode(OUTPUT_PIN, OUTPUT);
+    if (!initCamera()) {
+        return;
+    }
 
-    WiFi.begin(ssid, password);
-    Serial.print("Connecting to WiFi");
-
+    Serial.printf("Connecting to %s", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
-        Serial.print(".");
+        Serial.print('.');
     }
 
     Serial.println();
-    Serial.println("Connected!");
+    Serial.print("WiFi connected. IP address: ");
     Serial.println(WiFi.localIP());
 
-    startCamera();
-
     server.begin();
-    Serial.println("Server started.");
+    Serial.println("HTTP stream server started on port 80.");
 }
 
 void loop() {
     WiFiClient client = server.available();
-
-    if (client) {
-        Serial.println("Client connected.");
-
-        while (client.connected()) {
-
-            // Read input pin
-            bool inputState = digitalRead(INPUT_PIN);
-            digitalWrite(OUTPUT_PIN, inputState); // Mirror state
-
-            // Grab frame
-            camera_fb_t *fb = esp_camera_fb_get();
-            if (!fb) {
-                Serial.println("Camera frame failed");
-                continue;
-            }
-
-            client.println("HTTP/1.1 200 OK");
-            client.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
-            client.println();
-            client.println("--frame");
-            client.println("Content-Type: image/jpeg");
-            client.println("Content-Length: " + String(fb->len));
-            client.println();
-            client.write(fb->buf, fb->len);
-            client.println();
-
-            esp_camera_fb_return(fb);
-
-            delay(30);
-        }
-
-        client.stop();
-        Serial.println("Client disconnected.");
+    if (!client) {
+        delay(10);
+        return;
     }
+
+    Serial.println("Client connected.");
+    client.setTimeout(1000);
+
+    readClientRequest(client);
+    streamCamera(client);
+
+    client.stop();
+    Serial.println("Client disconnected.");
 }
